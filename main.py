@@ -1,9 +1,8 @@
 """
-Skyra Browser Service — Phase 2B
-==================================
-A lightweight FastAPI service that exposes Playwright browser automation
-over HTTP. Jarvis calls this service to browse the web, extract content,
-fill forms, click elements, and take screenshots.
+Skyra Browser Service
+=====================
+FastAPI microservice exposing Playwright browser automation.
+Supports stealth anti-detection measures and request-scoped isolated tab navigation.
 
 Port: 8004
 """
@@ -16,7 +15,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from loguru import logger
 
 
@@ -24,19 +23,24 @@ from loguru import logger
 _playwright = None
 _browser = None
 _context = None
+_active_page = None  # Persistent page for stateful clicks, typing, and screenshots
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start Playwright on startup, close on shutdown."""
+    """Start Playwright on startup with stealth options, close on shutdown."""
     global _playwright, _browser, _context
     try:
         from playwright.async_api import async_playwright
         logger.info("🌐 Browser Service: Starting Playwright...")
         _playwright = await async_playwright().start()
         _browser = await _playwright.chromium.launch(
-            headless=True,          # Run headless for background tasks
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"
+            ]
         )
         _context = await _browser.new_context(
             viewport={"width": 1280, "height": 800},
@@ -46,14 +50,22 @@ async def lifespan(app: FastAPI):
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        logger.info("🌐 Browser Service: Playwright ready ✅")
+        # Neutralize navigator.webdriver stealth init script
+        await _context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        logger.info("🌐 Browser Service: Playwright Context ready with stealth configurations ✅")
     except Exception as e:
         logger.error(f"❌ Browser Service: Failed to start Playwright: {e}")
-        logger.warning("  Run: playwright install chromium")
 
     yield
 
-    # Cleanup
+    # Cleanup active tab page
+    global _active_page
+    if _active_page:
+        try:
+            await _active_page.close()
+        except Exception:
+            pass
+    # Cleanup context and browser
     if _context:
         await _context.close()
     if _browser:
@@ -65,14 +77,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Skyra Browser Service",
-    description="Playwright browser automation for Jarvis",
-    version="1.0.0",
+    description="Stealth Playwright browser automation for Jarvis",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8000"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -81,59 +94,60 @@ app.add_middleware(
 # ── Request/Response Models ────────────────────────────────────────────────
 
 class BrowseRequest(BaseModel):
-    url: str
-    wait_for: Optional[str] = None    # CSS selector to wait for
+    url: str = Field(..., description="Target webpage URL to navigate to")
+    wait_for: Optional[str] = Field(None, description="Optional CSS selector to wait for")
 
 class ClickRequest(BaseModel):
-    url: Optional[str] = None         # Navigate first if provided
-    selector: str                     # CSS selector or text to click
+    url: Optional[str] = Field(None, description="Optional URL to navigate to first")
+    selector: str = Field(..., description="CSS selector of element to click")
 
 class TypeRequest(BaseModel):
-    selector: str
-    text: str
-    press_enter: bool = False
-
-class ExtractRequest(BaseModel):
-    url: str
-    selector: Optional[str] = None    # Extract specific element, or full page
+    selector: str = Field(..., description="CSS selector of target input element")
+    text: str = Field(..., description="Text content to input")
+    press_enter: bool = Field(False, description="True to simulate Enter keypress after filling")
 
 class SearchRequest(BaseModel):
-    query: str
-    engine: str = "google"            # google, bing, duckduckgo
+    query: str = Field(..., description="Search query string")
+    engine: str = Field("google", description="Target search engine: google, bing, duckduckgo")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _check_browser():
     if not _context:
-        raise HTTPException(status_code=503, detail="Browser not initialized")
+        raise HTTPException(status_code=503, detail="Browser not initialized or offline")
 
 
-async def _get_page():
-    """Get or create a page in the shared browser context."""
+async def _get_active_page():
+    """Retrieve or spawn the persistent active page context for stateful user interaction tools."""
+    global _active_page
     _check_browser()
-    pages = _context.pages
-    if pages:
-        return pages[-1]
-    return await _context.new_page()
+    if _active_page is None or _active_page.is_closed():
+        _active_page = await _context.new_page()
+    return _active_page
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "browser": _browser is not None}
+    return {
+        "status": "ok",
+        "service": "skyra-browser-service",
+        "browser": _browser is not None,
+        "active_tab": _active_page is not None and not _active_page.is_closed()
+    }
 
 
 @app.post("/browse")
 async def browse(req: BrowseRequest):
     """
-    Navigate to a URL and return the page title + main text content.
-    This is the primary 'read a web page' endpoint for Jarvis.
+    Stateless webpage reader: opens a fresh page, navigates, extracts readable content,
+    and closes the page inside a finally block to avoid memory leaks.
     """
     _check_browser()
+    page = await _context.new_page()
     try:
-        page = await _get_page()
         logger.info(f"🌐 Browsing: {req.url}")
         await page.goto(req.url, wait_until="domcontentloaded", timeout=30000)
 
@@ -142,16 +156,16 @@ async def browse(req: BrowseRequest):
 
         title = await page.title()
 
-        # Extract clean readable text (strip scripts, styles, nav noise)
+        # Clean read of inner body text (excluding script tags, headers/footers)
         text = await page.evaluate("""() => {
             const selectors = ['article', 'main', '.content', '#content', 'body'];
             for (const sel of selectors) {
                 const el = document.querySelector(sel);
                 if (el) {
-                    // Remove script and style tags
-                    el.querySelectorAll('script, style, nav, header, footer').forEach(e => e.remove());
-                    const text = el.innerText;
-                    if (text && text.length > 200) return text.slice(0, 5000);
+                    const clone = el.cloneNode(true);
+                    clone.querySelectorAll('script, style, nav, header, footer').forEach(e => e.remove());
+                    const txt = clone.innerText;
+                    if (txt && txt.length > 200) return txt.slice(0, 5000);
                 }
             }
             return document.body.innerText.slice(0, 5000);
@@ -165,36 +179,39 @@ async def browse(req: BrowseRequest):
         }
     except Exception as e:
         logger.error(f"❌ Browse error: {e}")
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Navigation failed: {str(e)}")
+    finally:
+        await page.close()
 
 
 @app.post("/search")
 async def search_web(req: SearchRequest):
     """
-    Perform a web search and return the top results.
+    Queries Google Search with robust selector fallbacks, returns title/link/snippet matching,
+    and closes pages immediately.
     """
     _check_browser()
+    page = await _context.new_page()
     try:
-        engines = {
-            "google": f"https://www.google.com/search?q={req.query.replace(' ', '+')}",
-            "bing": f"https://www.bing.com/search?q={req.query.replace(' ', '+')}",
-            "duckduckgo": f"https://duckduckgo.com/?q={req.query.replace(' ', '+')}",
-        }
-        url = engines.get(req.engine, engines["google"])
-
-        page = await _get_page()
+        query_encoded = req.query.replace(' ', '+')
+        url = f"https://www.google.com/search?q={query_encoded}"
+        
+        logger.info(f"🌐 Querying SERP: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # Extract search result snippets
+        # Parse SERP elements with robust fallbacks
         results = await page.evaluate("""() => {
             const items = [];
-            // Google results
-            document.querySelectorAll('div.g, div[data-sokoban-container]').forEach(el => {
-                const title = el.querySelector('h3')?.innerText;
-                const link = el.querySelector('a')?.href;
-                const snippet = el.querySelector('div[data-sncf], span[data-ved]')?.innerText
-                             || el.querySelector('.VwiC3b, .IsZvec')?.innerText;
-                if (title && link) items.push({ title, link, snippet: snippet || '' });
+            document.querySelectorAll('div.g, div[data-sokoban-container], div.kvH3rc, div.Z26q7c').forEach(el => {
+                const titleEl = el.querySelector('h3');
+                const linkEl = el.querySelector('a');
+                if (titleEl && linkEl) {
+                    const title = titleEl.innerText;
+                    const link = linkEl.href;
+                    const snippetEl = el.querySelector('div[data-sncf], span[data-ved], .VwiC3b, .IsZvec, .MUFIy, .Yy30fd');
+                    const snippet = snippetEl ? snippetEl.innerText : '';
+                    items.push({ title, link, snippet });
+                }
             });
             return items.slice(0, 8);
         }""")
@@ -206,80 +223,68 @@ async def search_web(req: SearchRequest):
         }
     except Exception as e:
         logger.error(f"❌ Search error: {e}")
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/extract")
-async def extract_content(req: ExtractRequest):
-    """
-    Navigate to URL and extract specific element content or full page text.
-    """
-    _check_browser()
-    try:
-        page = await _get_page()
-        await page.goto(req.url, wait_until="domcontentloaded", timeout=30000)
-
-        if req.selector:
-            el = page.locator(req.selector).first
-            content = await el.inner_text()
-        else:
-            content = await page.evaluate("() => document.body.innerText.slice(0, 8000)")
-
-        return {"success": True, "content": content.strip()}
-    except Exception as e:
-        logger.error(f"❌ Extract error: {e}")
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Search query failed: {str(e)}")
+    finally:
+        await page.close()
 
 
 @app.post("/click")
 async def click_element(req: ClickRequest):
     """
-    Click an element on the current page (or navigate first).
+    Executes a click against selector on the active browser tab page.
     """
     _check_browser()
     try:
-        page = await _get_page()
+        page = await _get_active_page()
         if req.url:
-            await page.goto(req.url, wait_until="domcontentloaded")
+            await page.goto(req.url, wait_until="domcontentloaded", timeout=30000)
 
+        await page.wait_for_selector(req.selector, timeout=10000)
         await page.click(req.selector, timeout=10000)
         await page.wait_for_load_state("domcontentloaded")
         title = await page.title()
 
-        return {"success": True, "page_title": title, "current_url": page.url}
+        return {
+            "success": True,
+            "page_title": title,
+            "current_url": page.url
+        }
     except Exception as e:
         logger.error(f"❌ Click error: {e}")
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Failed to click selector: {str(e)}")
 
 
 @app.post("/type")
 async def type_text(req: TypeRequest):
     """
-    Type text into an input field on the current page.
+    Fills text into target form element on the active page context.
     """
     _check_browser()
     try:
-        page = await _get_page()
+        page = await _get_active_page()
+        await page.wait_for_selector(req.selector, timeout=10000)
         await page.fill(req.selector, req.text)
         if req.press_enter:
             await page.press(req.selector, "Enter")
             await page.wait_for_load_state("domcontentloaded")
 
-        return {"success": True, "typed": req.text}
+        return {
+            "success": True,
+            "typed": req.text
+        }
     except Exception as e:
         logger.error(f"❌ Type error: {e}")
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Failed to input text: {str(e)}")
 
 
 @app.post("/screenshot")
 async def take_screenshot():
     """
-    Take a screenshot of the current browser page.
-    Returns base64-encoded PNG.
+    Captures base64 viewport snapshot of the active page tab.
     """
     _check_browser()
     try:
-        page = await _get_page()
+        page = await _get_active_page()
         screenshot_bytes = await page.screenshot(full_page=False)
         encoded = base64.b64encode(screenshot_bytes).decode("utf-8")
         return {
@@ -290,7 +295,7 @@ async def take_screenshot():
         }
     except Exception as e:
         logger.error(f"❌ Screenshot error: {e}")
-        return {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Failed to render screenshot: {str(e)}")
 
 
 if __name__ == "__main__":
